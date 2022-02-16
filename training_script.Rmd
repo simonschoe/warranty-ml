@@ -1,0 +1,782 @@
+---
+title: "Prediction Machines and Managerial Errors: The Case of Warranty Accounting"
+subtitle: "Training Script"
+author: Simon Schölzel
+date: 2020-02-16
+---
+
+```{r setup, include = FALSE}
+
+# package management
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, magrittr, here, config, tidymodels, doParallel, finetune, stacks, pins)
+
+# load config files
+Sys.setenv(R_CONFIG_ACTIVE = "training")
+config <- config::get(file = here::here("config.yml"))
+
+options(tidymodels.dark = TRUE)
+
+```
+
+
+# Load Data
+
+```{r}
+data_board <-
+  pins::board_folder(paste0(config$root_data_dir, config$path_data_board), versioned = T)
+
+data_board %>%
+  pins::pin_versions(paste0("data_merged_pgrp_", config$pgrp))
+```
+
+
+```{r}
+df_merged <- 
+  data_board %>%
+  # load product line data
+  pins::pin_read(., paste0("data_merged_pgrp_", config$pgrp)) %>% 
+  # remove products outside of sample period
+  filter(between(fy_end, as.Date(2011-09-30) + months(12), as.Date(2020-09-30))) %>% 
+  # order by time-series
+  arrange(warranty_end_dt) %>% 
+  # add row number
+  mutate(.row = row_number(), .before = "m_id") %>% 
+  # drop irrelevant factor levels
+  droplevels
+```
+
+
+# Data Budget Allocation
+
+```{r}
+initial_time_split_ <- function(data, split_var, test_year) {
+  
+  train_ids <- filter(data, !!sym(split_var) < as.Date(test_year))$.row
+  test_ids  <- filter(data, !!sym(split_var) == as.Date(test_year))$.row
+  
+  make_splits(
+    x = list("analysis" = train_ids, "assessment" = test_ids),
+    data = filter(data, !!sym(split_var) <= as.Date(test_year))
+  )
+  
+}
+
+time_split <- initial_time_split_(df_merged, split_var = "fy_end", test_year = config$test_fy)
+time_split
+```
+
+```{r}
+time_res <- 
+  sliding_period(
+    training(time_split),
+    fy_end, "year",
+    lookback = config$sliding_period$lookback,
+    assess_stop = config$sliding_period$assess_stop,
+    complete = T,
+    skip = config$sliding_period$skip
+  )
+
+time_res
+```
+
+
+# Base Setup
+
+```{r}
+predictors <- c(
+  # historical predictors
+  "op_hours__avg_fy_pre_st", "warr_cost__avg_fy_pre_st", "warr_cost__sd_fy_pre_st",
+  "labour_cost_rate__avg_fy_pre_st", "failure__rate_fy_pre_st", "claim__rate_fy_pre_st",
+  # fy end predictors
+  "warr_cost_incur", "warranty_remainder",
+  # geo predictors
+  "country", "coord_long", "coord_lat",
+  # product-specific predictors
+  "year_of_manufacture", "type", "stype", "mprice",
+  "commissioning_year", "commissioning_month", "commissioning_dow"
+)
+
+if (config$incl_manual_adj) {
+  # manual adjustments
+  predictors <- c(predictors, "AccAdj1", "AccAdj2")
+}
+
+rec_base <- 
+  recipe(training(time_split)) %>%
+  {
+    if (config$outcome == "warr_cost_proj") {
+      update_role(., warr_cost_proj, new_role = "outcome")
+    } else if (config$outcome == "AccEst3") {
+      update_role(., AccEst3, new_role = "outcome")
+    }
+  } %>% 
+  update_role(all_of(!!predictors), new_role = "predictor") %>% 
+  step_unknown(all_nominal_predictors(), new_level = "missing") %>% 
+  step_novel(all_nominal_predictors(), new_level = "new")
+
+rec_base %>%
+  pluck("var_info") %>%
+  filter(!is.na(role))
+```
+
+```{r}
+cores <-
+  parallel::detectCores(logical = T)
+
+performance_metrics <-
+  metric_set(rmse, mae)
+
+model_board <-
+  pins::board_folder(paste0(config$root_data_dir, config$path_model_board), versioned = T)
+```
+
+
+# Hyperparameter Tuning
+
+## Linear Regression
+
+```{r}
+set.seed(config$seed)
+
+rec_lm <- 
+  rec_base %>% 
+  step_other(all_nominal_predictors(), threshold = tune(), other = "other") %>% 
+  step_dummy(all_nominal_predictors(), one_hot = F)
+
+spec_lm <- 
+  linear_reg(mode = "regression", engine = "lm")
+
+grid_lm <- 
+  grid_regular(
+    threshold() %>% range_set(c(0, 0.25)),
+    levels = c(config$hyperparameters$linear_reg$threshold)
+  )
+
+comp_cluster <-
+  parallel::makeCluster(cores - 2, outfile = paste0("./logs/lm_", config$pgrp, ".txt"))
+
+doParallel::registerDoParallel(comp_cluster)
+
+start <- Sys.time()
+
+fit_lm <-
+  tune_grid(
+    workflow(rec_lm, spec_lm),
+    time_res,
+    grid = grid_lm,
+    metrics = performance_metrics,
+    control = control_grid(
+      verbose = T, allow_par = T, parallel_over = "resamples"
+    )
+  )
+
+Sys.time() - start
+
+fit_lm %>%
+  pin_write(
+    model_board, .,
+    name =
+      paste(
+        config$pgrp,
+        "lm",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      ),
+    type = "rds",
+    metadata = list(
+      pgrp = config$pgrp,
+      model = "lm",
+      outcome = config$outcome,
+      man_adj = config$incl_manual_adj,
+      test_year = as.Date(config$test_fy) %>% lubridate::year(),
+      lookback = config$sliding_period$lookback
+    )
+  )
+```
+
+```{r}
+if (!exists("fit_lm")) {
+  fit_lm <- 
+    pins::pin_read(
+      model_board,
+      paste(
+        config$pgrp,
+        "lm",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      )
+    )
+}
+
+fit_lm %>% 
+  show_best(metric = "rmse", n = 5)
+```
+
+
+## Elastic Net
+
+```{r}
+set.seed(config$seed)
+
+rec_elnet <- 
+  rec_base %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_other(all_nominal_predictors(), threshold = tune(), other = "other") %>% 
+  step_dummy(all_nominal_predictors(), one_hot = T) %>% 
+  step_zv(all_predictors())
+
+spec_elnet <- 
+  linear_reg(mode = "regression", engine = "glmnet") %>% 
+  set_args(
+    penalty = tune(),
+    mixture = tune()
+  )
+
+grid_elnet <- 
+  grid_regular(
+    threshold() %>% range_set(c(0, 0.25)), penalty(), mixture(),
+    levels = c(
+      config$hyperparameters$elastic_net$threshold,
+      config$hyperparameters$elastic_net$penalty,
+      config$hyperparameters$elastic_net$mixture
+    )
+  )
+
+comp_cluster <-
+  parallel::makeCluster(cores - 2, outfile = paste0("./logs/elnet_", config$pgrp, ".txt"))
+
+doParallel::registerDoParallel(comp_cluster)
+
+start <- Sys.time()
+
+fit_elnet <- 
+  tune_grid(
+    workflow(rec_elnet, spec_elnet),
+    time_res,
+    grid = grid_elnet,
+    metrics = performance_metrics,
+    control = control_grid(
+      verbose = T, allow_par = T, parallel_over = "resamples"
+    )
+  )
+
+Sys.time() - start
+
+fit_elnet %>%
+  pin_write(
+    model_board, .,
+    name =
+      paste(
+        config$pgrp,
+        "elnet",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      ),
+    type = "rds",
+    metadata = list(
+      pgrp = config$pgrp,
+      model = "elnet",
+      outcome = config$outcome,
+      man_adj = config$incl_manual_adj,
+      test_year = as.Date(config$test_fy) %>% lubridate::year(),
+      lookback = config$sliding_period$lookback
+    )
+  )
+```
+
+```{r}
+if (!exists("fit_elnet")) {
+  fit_elnet <-
+    pins::pin_read(
+      model_board,
+      paste(
+        config$pgrp,
+        "elnet",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      )
+    )
+}
+
+fit_elnet %>% 
+  show_best(n = 100, metric = "rmse")
+```
+
+
+## Random Forest
+
+```{r}
+set.seed(config$seed)
+
+SAMPLE_FRAC_RF <-
+  case_when(config$pgrp == 11 ~ 0.6, config$pgrp == 21 ~ 0.8, config$pgrp == 23 ~ 1.0)
+
+rec_rf <- 
+  rec_base %>% 
+  step_other(all_nominal_predictors(), threshold = tune(), other = "other")
+  
+spec_rf <- 
+  rand_forest(mode = "regression") %>% 
+  set_engine(engine = "ranger", sample.fraction = !!SAMPLE_FRAC_RF) %>% 
+  set_args(
+    trees = 1000,
+    mtry = tune(),
+    min_n = tune()
+  )
+
+grid_rf <- 
+  grid_regular(
+    threshold() %>% range_set(c(0, 0.25)),
+    finalize(mtry(), select(df_merged, all_of(predictors))),
+    min_n(c(20, 60)),
+    levels = c(
+      config$hyperparameters$random_forest$threshold,
+      config$hyperparameters$random_forest$mtry,
+      config$hyperparameters$random_forest$min_n
+    )
+  )
+
+comp_cluster <-
+  parallel::makeCluster(cores - 2, outfile = paste0("./logs/rf_", config$pgrp, ".txt"))
+
+doParallel::registerDoParallel(comp_cluster)
+
+start <- Sys.time()
+
+fit_rf <- 
+  tune_grid(
+    workflow(rec_rf, spec_rf),
+    time_res,
+    grid = grid_rf,
+    metrics = performance_metrics,
+    control = control_grid(
+      verbose = T, allow_par = T, parallel_over = "everything"
+    )
+  )
+
+Sys.time() - start
+
+fit_rf %>%
+  pin_write(
+    model_board, .,
+    name =
+      paste(
+        config$pgrp,
+        "rf",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      ),
+    type = "rds",
+    metadata = list(
+      pgrp = config$pgrp,
+      model = "rf",
+      outcome = config$outcome,
+      man_adj = config$incl_manual_adj,
+      test_year = as.Date(config$test_fy) %>% lubridate::year(),
+      lookback = config$sliding_period$lookback
+    )
+  )
+```
+
+```{r}
+if (!exists("fit_rf")) {
+  fit_rf <-
+    pins::pin_read(
+      model_board,
+      paste(
+        config$pgrp,
+        "rf",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      )
+    )
+}
+
+fit_rf %>% 
+  show_best(n = 50, metric = "rmse")
+```
+
+
+## Gradient Boosting Machine
+
+```{r}
+set.seed(config$seed)
+
+rec_gbm <- 
+  rec_base %>% 
+  step_other(all_nominal_predictors(), threshold = tune(), other = "other") %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+spec_gbm <- 
+  boost_tree(mode = "regression", engine = "xgboost") %>%
+  set_args(
+    trees = tune(),
+    mtry = tune(),  
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    sample_size = tune(),
+    stop_iter = 25
+  )
+
+grid_gbm <- 
+  grid_regular(
+    threshold(c(0.05, 0.2)),
+    trees(c(50, 150)),
+    mtry(c(20, 100)), # between sqrt and 30% of features
+    min_n(c(2, 10)),
+    tree_depth(c(2, 5)),
+    learn_rate(c(0, 1), trans = NULL) %>% value_set(c(0.01, 0.05, 0.1, 0.2)),
+    sample_size = sample_prop(c(0.5, 0.9)),
+    levels = c(
+      config$hyperparameters$gbm$threshold,
+      config$hyperparameters$gbm$trees,
+      config$hyperparameters$gbm$mtry,
+      config$hyperparameters$gbm$min_n,
+      config$hyperparameters$gbm$tree_depth,
+      config$hyperparameters$gbm$learn_rate,
+      config$hyperparameters$gbm$sample_size
+    )
+  )
+
+comp_cluster <-
+  parallel::makeCluster(cores - 2, outfile = paste0("./logs/gbm_", config$pgrp, ".txt"))
+
+doParallel::registerDoParallel(comp_cluster)
+
+start <- Sys.time()
+
+fit_gbm <- 
+  tune_grid(
+    workflow(rec_gbm, spec_gbm),
+    time_res,
+    grid = grid_gbm,
+    metrics = performance_metrics,
+    control = control_grid(verbose = T, allow_par = T, parallel_over = "everything")
+  )
+
+Sys.time() - start
+
+fit_gbm %>%
+  pin_write(
+    model_board, .,
+    name =
+      paste(
+        config$pgrp,
+        "gbm",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      ),
+    type = "rds",
+    metadata = list(
+      pgrp = config$pgrp,
+      model = "gbm",
+      outcome = config$outcome,
+      man_adj = config$incl_manual_adj,
+      test_year = as.Date(config$test_fy) %>% lubridate::year(),
+      lookback = config$sliding_period$lookback
+    )
+  )
+```
+
+```{r}
+if (!exists("fit_gbm")) {
+  fit_gbm <-
+    pins::pin_read(
+      model_board,
+      paste(
+        config$pgrp,
+        "gbm",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      )
+    )
+}
+
+fit_gbm %>%
+  show_best(n = 100, metric = "rmse")
+```
+
+
+## Support Vector Regression
+
+```{r}
+set.seed(config$seed)
+
+SAMPLE_FRAC_SVR <- if (config$pgrp == 11) 0.5 else NULL
+
+rec_svr <- 
+  rec_base %>% 
+  #step_normalize(all_numeric_predictors()) %>% 
+  step_sample(size = eval(SAMPLE_FRAC_SVR)) %>% 
+  step_other(all_nominal_predictors(), threshold = tune(), other = "other") %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  step_zv(all_predictors())
+
+spec_svr <- 
+  svm_rbf(mode = "regression") %>%
+  set_engine(engine = "kernlab", scaled = TRUE) %>%
+  set_args(
+    cost = tune(),
+    rbf_sigma = tune(),
+    margin = tune()
+  )
+
+grid_svr <- 
+  grid_regular(
+    threshold() %>% range_set(c(0, 0.25)),
+    cost() %>% range_set(c(-5, 5)),
+    rbf_sigma(),
+    svm_margin() %>% range_set(c(0, 0.25)),
+    levels = c(
+      config$hyperparameters$support_vector_regression$threshold,
+      config$hyperparameters$support_vector_regression$cost,
+      config$hyperparameters$support_vector_regression$rbf_sigma,
+      config$hyperparameters$support_vector_regression$margin
+    )
+  )
+
+comp_cluster <-
+  parallel::makeCluster(cores - 2, outfile = paste0("./logs/svr_", config$pgrp, ".txt"))
+
+doParallel::registerDoParallel(comp_cluster)
+
+start <- Sys.time()
+
+fit_svr <- 
+  tune_race_anova(
+    workflow(rec_svr, spec_svr),
+    time_res,
+    grid = grid_svr,
+    metrics = performance_metrics,
+    control = control_race(
+      verbose = T, verbose_elim = T,
+      allow_par = T, parallel_over = "everything",
+      burn_in = 3, alpha = 0.05, randomize = T
+    )
+  )
+
+Sys.time() - start
+
+fit_svr %>%
+  pin_write(
+    model_board, .,
+    name =
+      paste(
+        config$pgrp,
+        "svr",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      ),
+    type = "rds",
+    metadata = list(
+      pgrp = config$pgrp,
+      model = "svr",
+      outcome = config$outcome,
+      man_adj = config$incl_manual_adj,
+      test_year = as.Date(config$test_fy) %>% lubridate::year(),
+      lookback = config$sliding_period$lookback
+    )
+  )
+```
+
+```{r}
+plot_race(fit_svr) +
+  theme_classic()
+```
+
+```{r}
+if (!exists("fit_svr")) {
+  fit_svr <-
+    pins::pin_read(
+      model_board,
+      paste(
+        config$pgrp,
+        "svr",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      )
+    )
+}
+
+fit_svr %>% 
+  show_best(n = 100, metric = "rmse")
+```
+
+
+## Model Stack
+
+```{r}
+final_fit_lm <- 
+  workflow(rec_lm, spec_lm) %>% 
+  finalize_workflow(select_best(fit_lm, metric = "rmse")) %>% 
+  last_fit(time_split, metrics = performance_metrics)
+
+final_fit_elnet <- 
+  workflow(rec_elnet, spec_elnet) %>% 
+  finalize_workflow(select_best(fit_elnet, metric = "rmse")) %>% 
+  last_fit(time_split, metrics = performance_metrics)
+
+final_fit_rf <- 
+  workflow(rec_rf, spec_rf) %>% 
+  finalize_workflow(select_best(fit_rf, metric = "rmse")) %>% 
+  last_fit(time_split, metrics = performance_metrics)
+
+final_fit_gbm <- 
+  workflow(rec_gbm, spec_gbm) %>% 
+  finalize_workflow(select_best(fit_gbm, metric = "rmse")) %>% 
+  last_fit(time_split, metrics = performance_metrics)
+
+final_fit_svr <- 
+  workflow(rec_svr, spec_svr) %>% 
+  finalize_workflow(select_best(fit_svr, metric = "rmse")) %>% 
+  last_fit(time_split, metrics = performance_metrics)
+```
+
+```{r}
+set.seed(config$seed)
+
+ctrl_res <- 
+  control_resamples(verbose = T, save_pred = T, save_workflow = T)
+  
+spec_stack <- 
+  stacks() %>% 
+  add_candidates(
+    fit_resamples(
+      extract_workflow(final_fit_lm), time_res,
+      metrics = metric_set(rmse, mae),
+      control = ctrl_res
+    ),
+    name = "lm"
+  ) %>% 
+  add_candidates(
+    fit_resamples(
+      extract_workflow(final_fit_elnet), time_res,
+      metrics = metric_set(rmse, mae),
+      control = ctrl_res
+    ),
+    name = "elnet"
+  ) %>% 
+  add_candidates(
+    fit_resamples(
+      extract_workflow(final_fit_rf), time_res,
+      metrics = metric_set(rmse, mae),
+      control = ctrl_res
+    ),
+    name = "rf"
+  ) %>% 
+  add_candidates(
+    fit_resamples(
+      extract_workflow(final_fit_svr), time_res,
+      metrics = metric_set(rmse, mae),
+      control = ctrl_res
+    ),
+    name = "svr"
+  ) %>% 
+  add_candidates(
+    fit_resamples(
+      extract_workflow(final_fit_gbm), time_res,
+      metrics = metric_set(rmse, mae),
+      control = ctrl_res
+    ),
+    name = "gbm"
+  )
+
+spec_stack
+```
+
+```{r}
+set.seed(config$seed)
+
+fit_stack <- 
+  spec_stack %>% 
+  blend_predictions(
+    penalty = 10^seq(-10, 5, length = config$hyperparameters$stacking$penalty), mixture = 1,
+    metric = metric_set(rmse, mae),
+    control = control_grid(verbose = T, allow_par = F)
+  )
+
+fit_stack %>%
+  pin_write(
+    model_board, .,
+    name =
+      paste(
+        config$pgrp,
+        "stack",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      ),
+    type = "rds",
+    metadata = list(
+      pgrp = config$pgrp,
+      model = "stack",
+      outcome = config$outcome,
+      man_adj = config$incl_manual_adj,
+      test_year = as.Date(config$test_fy) %>% lubridate::year(),
+      lookback = config$sliding_period$lookback
+    )
+  )
+
+autoplot(fit_stack)
+```
+
+```{r}
+if (!exists("fit_stack")) {
+  fit_stack <-
+    pins::pin_read(
+      model_board,
+      paste(
+        config$pgrp,
+        "stack",
+        config$outcome,
+        if (config$incl_manual_adj) "incladj" else "excladj",
+        "testfy", as.Date(config$test_fy) %>% lubridate::year(),
+        "lb", config$sliding_period$lookback,
+        sep = "_"
+      )
+    )
+}
+
+final_fit_stack <- 
+  fit_members(fit_stack)
+
+tidy(final_fit_stack$coefs) %>% 
+  filter(term != "(Intercept)") %>% 
+  ggplot(aes(x = estimate, y = forcats::fct_reorder(term, estimate), fill = term)) +
+  geom_col()
+```
+

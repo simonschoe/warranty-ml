@@ -1,0 +1,46 @@
+default:
+  seed: 2021 
+  root_data_dir: <path-data-dir>        # path to data folder
+  path_data_board: <path-data-clean>    # path to specific dataset
+  path_model_board: <path-model-dir>    # path to model folder
+  pgrp: <1, 2, 3>                       # product line indicator, one of 1, 2, 3                     
+  
+
+training:
+
+  sliding_period:
+    lookback: 1                         # lenght of training window
+    skip: 0
+    assess_stop: 1                      # lenght of validation window
+
+  test_fy: 2019-09-30                   # test data period
+  incl_manual_adj: FALSE                # model incl./excl. managerial adjustments
+  outcome: warr_cost_proj               # response variable
+
+  hyperparameters:
+    linear_reg:
+      threshold: 6
+    elastic_net:
+      threshold: 6
+      mixture: 21
+      penalty: 21
+    random_forest:
+      threshold: 6
+      mtry: 21
+      min_n: 21
+    support_vector_regression:
+      threshold: 6
+      cost: 11
+      rbf_sigma: 11
+      margin: 6
+    gbm:
+      threshold: 4
+      trees: 5
+      mtry: 4
+      min_n: 5
+      tree_depth: 4
+      learn_rate: 4
+      sample_size: 5
+    stacking:
+      penalty: 16
+      
